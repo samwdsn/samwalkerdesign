@@ -77,7 +77,24 @@ if (typeof ScrollTrigger !== "undefined") {
   ScrollTrigger.config({ ignoreMobileResize: true });
 }
 
-const lenis = typeof Lenis !== "undefined" ? new Lenis() : null;
+const touchOnlyViewport = window.matchMedia("(hover: none) and (pointer: coarse)");
+const isIOSScrollDevice = /iPad|iPhone|iPod/i.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const useIOSScrollNormalizer = isIOSScrollDevice &&
+  typeof ScrollTrigger !== "undefined" &&
+  typeof ScrollTrigger.normalizeScroll === "function";
+
+// Use one scroll controller on iOS; leave Android and desktop on Lenis.
+const lenis = !useIOSScrollNormalizer && typeof Lenis !== "undefined"
+  ? new Lenis()
+  : null;
+const scrollNormalizer = useIOSScrollNormalizer
+  ? ScrollTrigger.normalizeScroll({
+      type: "touch",
+      allowNestedScroll: true,
+      momentum: () => 1.2,
+    })
+  : null;
 
 if (lenis) {
   lenis.on("scroll", ScrollTrigger.update);
@@ -87,6 +104,8 @@ if (lenis) {
 }
 
 let resizeTimer;
+let layoutViewportWidth = window.innerWidth;
+
 function refreshPageLayout() {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
@@ -95,7 +114,23 @@ function refreshPageLayout() {
   }, 150);
 }
 
-window.addEventListener("resize", refreshPageLayout);
+function handleViewportResize() {
+  const width = window.innerWidth;
+  const widthChanged = width !== layoutViewportWidth;
+  layoutViewportWidth = width;
+
+  // Mobile browser chrome changes the height while scrolling. Don't refresh
+  // animation positions for those changes or cancel a pending real refresh.
+  if (touchOnlyViewport.matches && !widthChanged) return;
+  refreshPageLayout();
+}
+
+window.addEventListener("resize", handleViewportResize);
+if (window.screen?.orientation?.addEventListener) {
+  window.screen.orientation.addEventListener("change", refreshPageLayout);
+} else {
+  window.addEventListener("orientationchange", refreshPageLayout);
+}
 document.fonts.addEventListener("loadingdone", refreshPageLayout);
 
 /* Move images inside their clipped frames, without moving captions or layout. */
@@ -114,7 +149,7 @@ function initImageParallax(selector, reverseSelector, amount) {
           trigger: frame,
           start: "top bottom",
           end: "bottom top",
-          scrub: true,
+          scrub: touchOnlyViewport.matches ? 0.2 : true,
           invalidateOnRefresh: true,
         },
       },
@@ -164,6 +199,7 @@ if (burgerButton && burgerMenu) {
     burgerButton.setAttribute("aria-label", "Close menu");
     document.documentElement.style.overflow = "hidden";
     lenis?.stop();
+    scrollNormalizer?.disable();
     burgerButton.focus({ preventScroll: true });
   });
 
@@ -175,6 +211,7 @@ if (burgerButton && burgerMenu) {
     burgerButton.setAttribute("aria-label", "Open menu");
     document.documentElement.style.overflow = "";
     lenis?.start();
+    scrollNormalizer?.enable();
     burgerButton.focus({ preventScroll: true });
   });
 
@@ -197,6 +234,16 @@ if (burgerButton && burgerMenu) {
    ========================================================================== */
 
 function initHomeSplash() {
+  const splashWrapper = document.querySelector(".splashParallax");
+  const splashSection = document.querySelector(".splashSection");
+  // Resolve CSS small-viewport units to pixels for GSAP. Unlike innerHeight,
+  // 100svh stays stable while the mobile browser toolbar opens and closes.
+  const viewportProbe = document.createElement("div");
+  viewportProbe.setAttribute("aria-hidden", "true");
+  viewportProbe.style.cssText = "position:absolute;top:0;left:0;width:0;height:100vh;height:100svh;visibility:hidden;pointer-events:none;overflow:hidden;";
+  splashWrapper.append(viewportProbe);
+  const smallViewportHeight = () => viewportProbe.getBoundingClientRect().height;
+
   const svgFrames = gsap.utils.toArray(".svgFrame");
   const svgFrameSequence = [0, 1, 0, 2, 0, 3, 0];
   const layoutDuration = 3 / 24;
@@ -234,6 +281,38 @@ function initHomeSplash() {
 
   // Keep the scroll position when switching between mobile and desktop.
   const splashMobileQuery = window.matchMedia("(width <= 640px)");
+  const splashSvg = splashSection.querySelector(".splashSVGContainer");
+  const splashCopy = splashSection.querySelector(".splashCopyContainer");
+  const ambitiousWord = splashSection.querySelector(".splashLine01 .revealWord:last-child");
+
+  // Use layout positions, ignoring GSAP's reveal/parallax transforms.
+  // Calculate a base size leaving 24px above AMBITIOUS; CSS adds 20px to it.
+  function layoutTop(element) {
+    let top = 0;
+    for (let node = element; node; node = node.offsetParent) {
+      top += node.offsetTop;
+    }
+    return top;
+  }
+
+  function fitMobileSplashSvg() {
+    if (!splashMobileQuery.matches) {
+      splashSvg.style.removeProperty("--mobile-splash-svg-space");
+      return;
+    }
+    const availableHeight = Math.max(
+      0,
+      Math.floor(layoutTop(ambitiousWord) - layoutTop(splashSvg) - 24),
+    );
+    splashSvg.style.setProperty("--mobile-splash-svg-space", `${availableHeight}px`);
+  }
+
+  fitMobileSplashSvg();
+  const splashLayoutObserver = new ResizeObserver(fitMobileSplashSvg);
+  splashLayoutObserver.observe(splashSection);
+  splashLayoutObserver.observe(splashCopy);
+  splashMobileQuery.addEventListener("change", fitMobileSplashSvg);
+
   let splashWasMobile = splashMobileQuery.matches;
   let breakpointScroll = null;
 
@@ -245,8 +324,12 @@ function initHomeSplash() {
 
   gsap.addEventListener("matchMedia", () => {
     if (breakpointScroll === null) return;
-    lenis.resize();
-    lenis.scrollTo(breakpointScroll, { immediate: true, force: true });
+    if (lenis) {
+      lenis.resize();
+      lenis.scrollTo(breakpointScroll, { immediate: true, force: true });
+    } else {
+      window.scrollTo({ top: breakpointScroll, left: 0, behavior: "instant" });
+    }
     breakpointScroll = null;
     ScrollTrigger.update();
   });
@@ -259,31 +342,43 @@ function initHomeSplash() {
       desktop: "(width > 640px)",
     },
     (context) => {
+      const scrollScrub = touchOnlyViewport.matches ? 0.2 : true;
       const settings = context.conditions.mobile
         ? {
             // Mobile settings
             width: "100%",
             start: "top bottom",
             end: "top top-=1400",
-            scrub: true,
-            svgParallaxY: -0.6,
-            copyParallaxY: -0.3,
+            scrub: scrollScrub,
+            // Fixed pixels: equivalent to 60/30svh at an 800px reference height.
+            svgParallaxY: -480,
+            copyParallaxY: -240,
             parallaxStart: "top top",
-            parallaxEnd: "bottom bottom",
-            parallaxScrub: true,
+            parallaxScrub: scrollScrub,
           }
         : {
             // Desktop settings
             width: "100%",
             start: "top bottom",
             end: "top top-=400",
-            scrub: true,
-            svgParallaxY: -0.3,
-            copyParallaxY: -0.3,
+            scrub: scrollScrub,
+            // Fixed pixels: equivalent to 30svh at an 800px reference height.
+            svgParallaxY: -240,
+            copyParallaxY: -240,
             parallaxStart: "top top",
-            parallaxEnd: "bottom bottom",
-            parallaxScrub: true,
+            parallaxScrub: scrollScrub,
           };
+
+      // Retain the splash's natural layout height so BTF scrolls over it.
+      // Unpin where CSS sticky previously reached its containing block's end.
+      ScrollTrigger.create({
+        trigger: splashWrapper,
+        start: "top top",
+        end: () => `+=${Math.max(1, splashWrapper.offsetHeight - splashSection.offsetHeight)}`,
+        pin: splashSection,
+        pinSpacing: false,
+        invalidateOnRefresh: true,
+      });
 
       gsap
         .timeline({
@@ -291,7 +386,7 @@ function initHomeSplash() {
           scrollTrigger: {
             trigger: ".splashParallax",
             start: settings.parallaxStart,
-            end: settings.parallaxEnd,
+            end: () => `+=${Math.max(1, splashWrapper.offsetHeight - smallViewportHeight())}`,
             scrub: settings.parallaxScrub,
             invalidateOnRefresh: true,
           },
@@ -299,14 +394,14 @@ function initHomeSplash() {
         .to(
           ".splashSVGContainer",
           {
-            y: () => window.innerHeight * settings.svgParallaxY,
+            y: settings.svgParallaxY,
           },
           0,
         )
         .to(
           ".splashNav, .splashCopyContainer",
           {
-            y: () => window.innerHeight * settings.copyParallaxY,
+            y: settings.copyParallaxY,
           },
           0,
         );
